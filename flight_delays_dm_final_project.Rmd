@@ -1,0 +1,647 @@
+---
+title: "Analyzing Flight Delays"
+author: "Team 2slow2furious: Justin Cole, Mark Grobaker, and Yoni Steinberg"
+date: "March 10, 2017"
+output:
+
+  github_document
+---
+
+### Introduction
+
+Between 2007-2016, the U.S. Department of Transportation's (DOT) Bureau of Transportation Statistics found that flights across the entire system were, on average, delayed 20% of the time. DOT defines "on time" as any flight that arrives within 15 minutes of schedule.
+
+A research group at the National Center for Excellence for Aviation Operations Research (NEXTOR) found that, in 2007 alone, the total cost of flight delays was $32.9 billion, of which more than half of the total cost ($16.7 billion) was borne by passengers. This number was calculated based on lost passenger time due to flight delays, cancellations and missed connections, as well as expenses for food and accommodations as a result of being away from home.
+
+So we began to ask the question: What if we could reliably predict flight delays and communicate that information to passengers? We decided not to attempt to change the total number of delays (i.e. by designing a system that could alert particular airlines to increase their resources if a flight was at-risk of being delayed) as we did not feel like the incentives are properly aligned to encourage airlines to change their behaviors. 
+
+However, we instead directed our efforts at gaining back some of that $16.7 billion that is stolen from passengers (ourselves included) each year. This is based on the assumption that if our predictions are accurate enough, we may be able to change some customers' behaviors (this could be as simple as encouraging people to bring their own food so that they are not stuck having to purchase overpriced meals in the case of their flight being delayed or be prepared to call their airline to reschedule a connection if they have a short layover).  
+
+We decided to deliver this prediction through the creation of an iPhone and Android app that would allow people to input their flight number at any time and get the historic flight delay likelihood for that flight number. Additionally, because we anticipate that there is a "cascading" effect of delays, we would have a "real-time" option that would allow users to receive an automated text message 2 hours before the flight departs that would provide them an updated prediction, using information about the flight delay status of other flights on that day.
+
+For the purposes of the beta version, we would predict potential flight delays only for those people on flights who are departing from Pittsburgh airport. 
+
+##Choosing the Outcome Variable
+
+To begin our prediction, we began with an initial dataset of all flights departing and arriving at Pittsburgh airport in the year 2006, which consisted of 94,944 observations and 59 variables.
+
+The dataset included a number of potential outcome variables, including continuous variables indicating the actual delay (in minutes) as well as a number of binary variables for whether the flight was delayed by a certain amount (for instance, if it was delayed by 15 or 30 minutes). 
+
+Given that we are predicting delays only for those people on flights who are departing from Pittsburgh airport, we first subset the data to only include those flights whose origin was Pittsburgh airport, which left us with 47,455 observations. 
+
+For choosing the outcome variable, we decided to select DepDel15, a binary variable that is "1" if a departure is delayed more than 15 minutes and "0" if a departure is delayed fewer than 15 minutes. We used this variable because it aligned with the DOT's definition of "delayed." 
+
+##Intuition About Variable Selection
+
+Our intuition before beginning variable selection was that a number of variables would be good predictors of flight delays, including the carrier (we expected budget airlines to experience greater delays), the day of the week (we expected flights on high-travel days like Friday and Sunday to experience greater delays), the month (we expected flights in the winter to experience greater delays), the departure time block (we expected evening flights to be more delayed), and the destination (we expected high-volume airports, like NYC's JFK and LGA and Chicago's ORD, to experience greater delays). 
+
+## 1. Data Summary & Problem
+```{r}
+#load packages
+library(plyr)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(MASS)
+library(partykit)
+library(caret)
+library(rpart)
+library(randomForest)
+library(pROC)
+library(tree)
+library(partykit)
+library(gbm)
+library(tidyr)
+library(gridExtra)
+library(glmnet)
+
+#read in the data
+all.flight.data <- read.csv("all_PIT_2006.csv")
+```
+
+2016.data
+```{r}
+new.flight.data <- read.csv("2016.flight.data.csv")
+summary(new.flight.data$carrier)
+#change carrier code to carrier name
+new.flight.data <- transform(new.flight.data, carrier = as.factor(mapvalues(carrier, from = c('AA', 'AS','B6', 'DL', 'EV', 'F9', 'OO', 'UA', 'WN'),  to = c('American','Alaska', 'Jetblue', 'Delta', 'ExpressJet', 'Frontier', 'SkyWest', 'United', 'Southwest'))))
+
+
+```
+
+##Incorporating New Variables
+
+After examining variables in the initial data set, we reasoned that there may be additional variables that were not included in the original dataset that would be helpful in the prediction task.
+
+First, we used the Aircraft Registration Database in order to look up the capacity of each of the aircraft using the aircraft's tail number, as our intuition led us to believe that planes with a higher capacity would require more time to onload and offload and thus might be more prone to delays. After a series of data-wrangling maneuvers, we were able to successfully match approximately 66% of the flights in our dataset with their capacity. We then used binning to bin the plane capacities into 5 different bins (including "Unknown", which was used for those flights we were unable to find capacities for).  
+
+We also constructed a new variable called "Delays so Far Today" that uses the Departure Time Block and looks at the count of the number of flights that have been delayed from the beginning of that day up to a point that is 2 hours before the flight departs (this is to ensure that we are able to provide information to the app user with enough time for them to be able to change their behavior, if desired). 
+
+There were a number of other variables that we also created using derivatives of the existing variables, such as: 
+
+- Airport.Region = used Destination airport's city and state and then assigned that Destination to the proper geographic region (Midwest, Northeast, etc.)
+- NumDelaysYest = Aggregated the total number of departure delays at Pittsburgh airport the previous day
+- NumFlightsToday = Aggregated the total number of flights departing from Pittsburgh airport that day
+- NumFlightsToDest = Aggregated the total number of flights that travel to that destination over the entire year of 2006 
+- Is.Weekend = Used the DayofWeek variable and coded all values of 6 and 7 as TRUE
+- Is.Holiday = Used the Date variable to cross-reference the date with all Federal holidays (excluding Columbus Day and Veterans Day), with +- 1 day, and coded all as Holiday.
+
+
+##Removing Variables
+
+The largest chunk of time spent on this project was undoubtedly feature engineering. We first went through all 59 variables and, using the data dictionary available on the DOT's Bureau of Transportation Statistics website, characterized the variable type, expected importance, range of values, and definition of each variable. While this process was time-consuming, it helped us to quickly identify variables in 3 broad categories that we did not need. The first category included variables that were duplicative or unnecessary, such as UniqueCarrier and Carrier, as they were equivalent to AirlineID. This grouping also included variables that were made unecessary due to the response variable that we selected (DepDel15), such as DepDel30, DepDelSys15, and ArrDel15. The second category included a number of other variables that were derivations of other variables, such as CRSDepTime and TaxiOut. The final category were variables that are only observed after the flight departs and therefore should not be included in the prediction itself, such as ActualElapsedTime, WheelsOn, CarrierDelay, etc. 
+
+```{r}
+#limit to departing flights only
+flight.data1 <- subset(all.flight.data, subset = Origin == 'PIT')
+
+#get plane capacity
+#read data
+flight.capacity = read.csv("CapacityData.csv", header = TRUE)
+#dedup by TailNum
+cap.lookup = subset(flight.capacity, !duplicated(TailNum))
+cap.lookup = cap.lookup[,c('TailNum','Capacity')]
+#merge in data
+flight.data1 = merge(flight.data1, cap.lookup, by='TailNum')
+#create capacity groups
+flight.data1 <- mutate(flight.data1, capacity.cat = 
+   cut(Capacity, breaks = c(-2, 0, 10, 55, 140, 200, 600),
+       labels = c('unknown capacity','very low capacity', 
+                  'low capacity', 'medium capacity',
+                  'high capacity', 'very high capacity')))
+
+#read in airport.codes, which will be used later to get Airport.Region
+airport.codes = read.csv("airport_codes.csv", header = TRUE)
+
+#convert to date type
+flight.data1$FlightDate = as.Date(flight.data1$FlightDate, format = "%m/%d/%Y")
+
+#change carrier code to carrier name
+flight.data1 <- transform(flight.data1, Carrier = as.factor(mapvalues(Carrier, from = c('B6','CO','DL', 'EV', 'FL', 'MQ', 'NW', 'OH', 'OO', 'RU', 'UA', 'US', 'WN', 'XE', 'YV'),  to = c('Jetblue', 'Continental', 'Delta', 'ExpressJet', 'Frontier', 'Simmons', 'Northwest', 'PSA', 'SkyWest', 'ExpressJet', 'United', 'USAir', 'Southwest', 'ExpressJet', 'Northwest'))))
+
+#More feature engineering
+
+#select columns of interest for model building
+#select the columns from the data that we want to use
+colnames2 <- c('FlightDate', 'Carrier', 'TailNum', 'Quarter', 'Month', 'DayofMonth', 'DayOfWeek', 'Distance', 'DistanceGroup', 'CRSElapsedTime', 'ArrTimeBlk', 'DepTimeBlk', 'Dest', 'DepDel15', 'capacity.cat')
+flight.data2 <- subset(flight.data1, select = colnames2, subset = Origin == 'PIT')
+
+#convert all columns to factors
+flight.data2 = colwise(as.factor)(flight.data2)
+#reset some columns to numeric
+flight.data2$CRSElapsedTime = 
+  as.numeric(as.character(flight.data2$CRSElapsedTime))
+flight.data2$Distance = as.numeric(as.character(flight.data2$Distance))
+#reset some columns to Date
+flight.data2$FlightDate = as.Date(flight.data1$FlightDate, format = "%m/%d/%Y")
+
+#DestNumFlightsGroup. get number of flights by destination
+DestNumFlights = ddply(flight.data2, "Dest", summarise, num.flights.to.dest = length(Dest))
+DestNumFlights$num.flights.to.dest.group = cut_number(DestNumFlights$num.flights.to.dest, n=5, dig.lab=12)
+
+#DestAvgDepDelayPct
+DestAvgDepDelayPct = ddply(flight.data2, "Dest", summarise, dest.avg.delay.pct = sum(sum(DepDel15 == 1))/length(DepDel15))
+
+#NumFlightsToday
+NumFlightsToday = ddply(flight.data2, "FlightDate", summarise, num.flights.today = length(Dest))
+#create bins
+#NumFlightsToday$num.flights.today.group = cut_number(NumFlightsToday$num.flights.today, n=10)
+
+#NumDelaysYest. (RStudio highlights this line red when it runs, but in fact it does not throw any error.)
+NumDelaysYest = ddply(flight.data2, "FlightDate", summarise, num.delays.yest = sum(DepDel15 == 1))
+
+#keep just a subset of the columns as NumDelaysToday
+NumDelaysToday = subset(NumDelaysYest, select=c('FlightDate','num.delays.yest'))
+#rename columns
+colnames(NumDelaysToday) = c('FlightDate', 'num.delays.today')
+
+#will use lead column when doing merge, so that we get previous day's delay
+NumDelaysYest$FlightDateLead = NumDelaysYest$FlightDate + 1
+#keep just a subset of the colums as NumDelaysYest
+NumDelaysYest = subset(NumDelaysYest, select=c('FlightDateLead','num.delays.yest'))
+
+#fill in the df with values for 1/1/2006, which is a special case
+NumDelaysYest[nrow(NumDelaysYest)+1,"FlightDateLead"] =
+  as.Date('1/1/2006', format="%m/%d/%Y")
+#since we don't have delays for previous day, 12/31/2005,
+#just set num.delays.yest equal to the average
+NumDelaysYest[nrow(NumDelaysYest),"num.delays.yest"] =
+  round(mean(NumDelaysYest$num.delays.yest, na.rm=T))
+
+#NumDelaysSoFarToday
+#sum up delays by date and time block
+NumDelaysSoFarToday = ddply(flight.data2, c("FlightDate","DepTimeBlk"), summarise, num.delays.in.deptimeblock = sum(DepDel15 == 1))
+#loop through to get delays so far today
+for (i in 1:nrow(NumDelaysSoFarToday)) {
+  #get the departure time blocks today
+  deptimeblocks.today = subset(NumDelaysSoFarToday, subset = FlightDate == FlightDate[i])
+  #subset to get just those deptimeblocks that are earlier today
+  #we require the block to be at least two blocks previous to the current
+  #eg if in 3-4 block, only count delays from 1-2 and before
+  deptimeblocks.earlier.today = subset(deptimeblocks.today, subset = as.numeric(deptimeblocks.today$DepTimeBlk) <= as.numeric(NumDelaysSoFarToday$DepTimeBlk[i]) - 2)
+  #take sum to get delays so far today
+  NumDelaysSoFarToday$num.delays.so.far.today[i] =   sum(deptimeblocks.earlier.today$num.delays.in.deptimeblock)
+}
+
+#holidays
+#list out all federal holidays, +/- 1 day, in 2006
+#this includes: new years, mlk day, presidents day, memorial day
+#independence day, labor day, thanksgiving, and christmas
+#columbus day and veterans day are excluded
+holidays <- c(
+    '12/31/2006','1/1/2006','1/2/2006',
+    '1/15/2006','1/16/2006','1/17/2006',
+    '2/19/2006','2/20/2006','2/21/2006',
+    '5/28/2006','5/29/2006','5/30/2006',
+    '7/3/2006','7/4/2006','7/5/2006',
+    '9/3/2006','9/4/2006','9/5/2006',
+    '11/22/2006','11/23/2006','11/24/2006',
+    '12/24/2006','12/25/2006','12/26/2006')
+holidays = as.Date(holidays, format = '%m/%d/%Y')
+
+#add Is.Holiday column 
+flight.data2 = mutate(flight.data2, Is.Holiday = FlightDate%in%holidays)
+#add Is.Weekend column
+flight.data2 = mutate(flight.data2, Is.Weekend = DayOfWeek%in%c(6,7))
+
+#convert to factors
+flight.data2$Is.Holiday <- as.factor(flight.data2$Is.Holiday)
+flight.data2$Is.Weekend <- as.factor(flight.data2$Is.Weekend)
+
+```
+
+Merge data and prepare data set for model
+```{r}
+#create summary table by airport
+DestSummary = 
+  merge(DestNumFlights, DestAvgDepDelayPct, by='Dest') %>%
+  merge(airport.codes, by.x='Dest', by.y='Airport.Code')
+
+#merge all created features with the main flights df
+flight.data3 = merge(flight.data2, DestSummary, by='Dest')
+flight.data3 = merge(flight.data3, NumDelaysSoFarToday,
+                     by=c('FlightDate','DepTimeBlk'))
+flight.data3 = merge(flight.data3, NumDelaysToday, 
+                     by.x='FlightDate', by.y='FlightDate', all.x=T)
+flight.data3 = merge(flight.data3, NumDelaysYest, 
+                     by.x='FlightDate', by.y='FlightDateLead', all.x=T)
+flight.data3 = merge(flight.data3, NumFlightsToday, by='FlightDate')
+
+#export data for QC purposes
+# write.table(flight.data3, "flight_data_3_export.csv", sep=',', row.names=F)
+```
+
+Select final data to be used in model
+```{r}
+#remove columns that will not be used in model
+colnames4 <- colnames(flight.data3)[! colnames(flight.data3) %in% c('TailNum', 'Airport.City', 'num.delays.in.deptimeblock', 'num.delays.today', 'FlightDate', 
+'Dest', 'num.flights.to.dest.group')
+  ]
+
+flight.data4 <- subset(flight.data3, select = colnames4)
+```
+
+##Pre-Processing Data
+
+As we performed basic descriptive statistics on our data, we found that the sample was significantly unbalanced, with only 18% of our values labeled as "delayed." As a result, we tried upsampling our data in order to create additional observations of "delays" but we ultimately did not find that it helped our model's performance and did not end up incorporating it into our final model. 
+
+Within each model we later ran, we performed the usual error estimates such as crossvalidation. However, for a final comparison of model results, it was also important to create a test set for comparison purposes.
+
+We created a test and train data set by randomly sampling 1/8 of the observations and placing them into a test data set and keeping the remaining 7/8 of the observations in the training data set. 
+
+```{r}
+#create train and test data set
+test <- sample(1:nrow(flight.data4), nrow(flight.data4)/8)
+flight.test <- flight.data4[test,]
+flight.train <- flight.data4[-test,]
+
+#actual class in test data (as numeric)
+flight.obs <- as.numeric(as.character(flight.test$DepDel15))
+
+#Upsample the training data to artifically overcome sample imbalance
+flight.more.idx <- sample(which(flight.train$DepDel15 == "1"), 27000, replace = TRUE)
+flight.train.upsampled <- rbind(flight.train,
+                            flight.train[flight.more.idx, ])
+table(flight.train.upsampled$DepDel15)
+```
+
+##Classification Performance Metrics
+
+For reporting out classification performance metrics, we used the classMetrics formula that we created in Homework 5. 
+
+```{r}
+classMetrics <- function(score, y, cutoff, 
+                         type = c("all", "accuracy", "sensitivity", 
+                                  "specificity", "ppv", "npv", "precision", 
+                                  "recall")) {
+  type <- match.arg(type, several.ok = TRUE)
+  n <- length(y) 
+  
+  # Form confusion matrix
+  score.factor <- factor(as.numeric(score >= cutoff), levels = c("0", "1"))
+  confusion.mat <- table(score.factor, as.factor(y), dnn = list("predicted", "observed"))
+  # Calculate all metrics
+  acc <- sum(diag(confusion.mat)) / n
+  sens <- confusion.mat[2,2] / sum(confusion.mat[,2])
+  spec <- confusion.mat[1,1] / sum(confusion.mat[,1])
+  ppv <- confusion.mat[2,2] / sum(confusion.mat[2,])
+  npv <- confusion.mat[1,1] / sum(confusion.mat[1,])
+  prec <- ppv
+  rec <- sens
+  
+  metric.names <- c("accuracy", "sensitivity", "specificity", 
+                    "ppv", "npv", "precision", "recall")
+  metric.vals <- c(acc, sens, spec, ppv, npv, prec, rec)
+  
+  # Form into data frame
+  full.df <- data.frame(value = metric.vals)
+  rownames(full.df) <- metric.names
+  
+  # Return just the requested subset of metrics
+  if(type[1] == "all") {
+    list(conf.mat = confusion.mat, perf = full.df)
+  } else {
+    list(conf.mat = confusion.mat, 
+         perf = subset(full.df, subset = metric.names %in% type))
+  }
+}
+```
+
+**Exploratory Data Analysis** 
+
+We were curious to see if there are any noteworthy patterns in our data that could be picked out visually before our models are built. We made four initial plots:
+
+1) 2006 carrier count plot
+2) Destination Frequency 
+3) %Delay by Airport
+4) %Delays by Month
+
+
+2006 carrier count plot
+```{r}
+flight.data.plot = ddply(flight.data4, "Carrier", summarise, count.flight = length(Carrier))
+
+flight.data.plot1 <- transform(flight.data.plot, Carrier = reorder(Carrier, count.flight))
+
+EDAcarrier.plot <- ggplot(flight.data.plot1, mapping = aes(x = Carrier, y = count.flight, fill = Carrier))
+
+plot1.2006 <-EDAcarrier.plot + geom_bar(stat = "identity") + ggtitle("Carrier Count 2006") + theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45), axis.title.x = element_blank(), axis.title.y = element_blank()) + ylim(0, 17500) + theme(legend.position="none")
+
+plot1.2006
+```
+We see that USAir is the largest carrier, followed distantly by Southwest.
+
+Destination Frequency 
+```{r}
+flight.dest.plot <- DestSummary %>%
+  group_by(Dest) %>%
+  arrange(desc(num.flights.to.dest))
+
+flight.dest.plot <- transform(flight.dest.plot, Dest = reorder(Dest, desc(as.numeric(num.flights.to.dest))))
+
+ggplot(flight.dest.plot, mapping = aes(x = Dest, y = num.flights.to.dest, color = Dest)) + geom_bar(stat = "identity") + ggtitle("Dest Frequency") + theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 60)) + theme(legend.position="none")
+```
+The most-traveled to airports (from Pittsburgh) are Philadelphia, Chicago O'Hare, and Atlanta.
+
+
+%Delay by Airport
+```{r}
+flight.delay.plot <- DestSummary %>%
+  filter(dest.avg.delay.pct < 1) %>%
+  group_by(Dest) %>%
+  arrange(desc(dest.avg.delay.pct))
+  
+flight.delay.plot <- transform(flight.delay.plot, Dest = reorder(Dest, desc(as.numeric(dest.avg.delay.pct))))
+
+#% delay by airport
+ggplot(flight.delay.plot, mapping = aes(x = Dest, y = dest.avg.delay.pct, color = Dest)) + geom_bar(stat = "identity") + ggtitle("% Delay by Airport") + theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 60)) + theme(legend.position="none")
+```
+
+Of the top five airport destinations with the highest delays, two are ones with very few flights: Seattle and Myrtle Beach.
+Newark (EWR), New York (JFK), and Chicago (ORD) are large destinations with high delay rates.
+
+% Delays by month
+```{r}
+delays.by.month = ddply(flight.data3, c("Month","DepDel15"), summarise, total.delayed = sum(DepDel15 == 1), total.ontime =sum(DepDel15==0))
+
+delays.by.month.sub <- delays.by.month[,c(1,3,4)]
+
+delay.melt <- reshape2::melt(delays.by.month.sub, id.vars = 'Month', measure.vars = c('total.delayed', 'total.ontime'))
+delay.melt <- delay.melt %>%
+  filter(value > 0)
+
+delays.by.month.spread <- spread(delay.melt, key = variable, value = value)
+delays.by.month.spread <- delays.by.month.spread %>%
+  mutate(perct.delay = total.delayed/total.ontime) 
+
+ggplot(delays.by.month.spread, mapping = aes(x = Month, y = perct.delay, color = Month)) + geom_bar(stat = "identity") + ggtitle("% Delay by Month") + theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 60)) + theme(legend.position="none")
+```
+
+##Running the models
+
+We ended up running five models for our classification task:
+ 
+Regularized Logistic Regression: the pros are that it is interpretable and performs variable selection; however, the cons are that it is less flexible and assumes no interaction terms 
+
+Decision Tree: the pros are that it is highly interpretable; however, the cons are that it is  highly variable and generally has poor classification accuracy 
+
+Random forests: the pros are that it is can capture interaction, which we believe to be important here, and it is highly flexible; however, the cons are that it produces results that are less interpretable
+
+Bagging: similar tradeoffs as random forests
+
+Boosting: similar tree-based ensemble method. Approach is different from bagging and RF, but the pros and cons are similar.
+
+
+##Regularized Logistic Regression
+
+For the regularized logistic regression, we first ran cross-validation on our data and then found our lambda that minimizes cross-validation error and then found the largest lambda within one standard error of the minimum. We then ran the lasso model and got predictions using the lambda that we found.
+```{r, cache=TRUE}
+#subset of training data, with outcome variable removed
+#create sparse matrix
+flight.train.pred = model.matrix(~., data = flight.train[,!(colnames(flight.train) == "DepDel15")])
+#do same for test data
+flight.test.pred = model.matrix(~., data = flight.test[,!(colnames(flight.test) == "DepDel15")])
+
+#run crossvalidation
+flight.lasso.cv <- cv.glmnet(x=flight.train.pred, y=flight.train$DepDel15, family="binomial")
+
+plot(flight.lasso.cv)
+
+# Lambda min:
+flight.lasso.cv$lambda.min
+# Lambda 1-SE
+flight.lasso.cv$lambda.1se
+
+# Index of the two lambdas
+lambda.min.idx <- which(flight.lasso.cv$lambda == flight.lasso.cv$lambda.min)
+lambda.1se.idx <- which(flight.lasso.cv$lambda == flight.lasso.cv$lambda.1se)
+
+# Number of non-zero coefficients:
+# Lambda min
+flight.lasso.cv$nzero[lambda.min.idx]
+# Lambda 1-SE
+flight.lasso.cv$nzero[lambda.1se.idx]
+
+#run lasso model
+flight.lasso <- glmnet(x=flight.train.pred, flight.train$DepDel15, family="binomial")
+
+#show the most important variables
+flight.lasso.coef = coef(flight.lasso, s=flight.lasso.cv$lambda.1se)[,1]
+#flight.lasso, s=flight.lasso.cv$lambda.1s
+flight.lasso.coef = sort(flight.lasso.coef[flight.lasso.coef!=0])
+flight.lasso.coef
+```
+
+We choose the 1SE lambda, shown on the graph above.
+
+Variables with the most negative values contribute most to having on-time performance. We notice that (mostly) early departing flights are located here. On the other end, afternoon and evening departing flights are more likely to be late. The most predictive of delay is dest.avg.delay.pct. All of these results are somewhat intuitive, which is nice.
+
+Note that since the intercept is around -3, the coefficients on the other variables may be greater than 1.
+
+Here we see one of the major advantages of logistic regression: we are easily able to understand the output. We can see just how much each variable contributes to the probability of a late flight.
+
+##Simple Decision Tree Model
+```{r, cache=TRUE}
+#create naive decision tree
+flight.tree <- tree(DepDel15 ~ ., flight.train)
+summary(flight.tree)
+
+#plot decision tree
+plot(flight.tree)
+text(flight.tree, pretty=0)
+print(flight.tree)
+```
+
+The tree shown above is small and does not need pruning.
+The tree only uses two variables, num.delays.so.far.today, and dest.avg.delay.pct. All leaves of the tree have a predicted class of 0 (given a cutoff of 0.5) but different class probabilities.
+
+##Random Forest
+```{r, cache=TRUE}
+#run random forest
+#for mtry we did the sqrt of the number of variables, and for ntree we looked at a test classification error plot that showed that at around 100 trees our classification error rate stayed flat
+flight.rf <- randomForest(as.factor(DepDel15) ~ ., data = flight.train, mtry = 5, ntree=100,importance = T)
+flight.rf
+
+plot(flight.rf)
+summary(flight.rf)
+varImpPlot(flight.rf, cex=0.7)
+importance(flight.rf)
+```
+
+When selecting the parameters for our Random Forest, we used the accepted best practice of using the square root of the number of variables for our mtry parameter. We also plotted the flight.rf function and observed the test classification error plot that showed that at around 100 trees our classification error rate stayed flat. As such, we selected ntree=100 in order to simplify our model.
+
+The variable importance plot shows that the most important variables are: Month, DayofMonth
+
+The next most important variables are:
+num.delays.so.far.today, num.delays.yest, DepTimeBlk, Carrier, DayOfWeek
+
+##Bagging Classification Trees
+```{r, cache=TRUE}
+flight.bag <- randomForest(as.factor(DepDel15) ~ ., data = flight.train, mtry = ncol(flight.data4), ntree=100,importance = T)
+flight.bag
+
+#plot
+plot(flight.bag)
+#summary(flight.bag)
+varImpPlot(flight.bag, cex=0.7)
+importance(flight.bag)
+```
+Based on the plot of flight.bag, we choose ntree of 100.
+
+Variable importance plot shows that the most important variables are: num.delays.so.far.today, DayofMonth
+The next most important variables are:
+DepTimeBlk, Carrier, Month, num.delays.yest, DayOfWeek, CRSElapsedTime, num.delays.yest
+
+##Boosting
+```{r, cache=TRUE}
+#run boosting. (takes ~5 minutes for n.trees=1000)
+boost.flight <- gbm(as.numeric(flight.train$DepDel15 == 1) ~ ., data=flight.train, distribution ="bernoulli", n.trees=500, interaction.depth = 2,verbose=F, shrinkage = 0.1, cv.folds=10)
+
+#show CV error by number of trees
+qplot(1:500, boost.flight$cv.error, xlab = "Number of trees")
+#variable importance plot. barplot options based on http://statmethods.net/graphs/bar.html
+par(las=2, mar=c(5,8,4,2), cex.axis = 0.75)
+summary(boost.flight)
+```
+Based on CV error, 500 trees appears to be sufficient.
+
+The most important variables are: num.delays.so.far.today, DayOfMonth, Carrier, ArrTimeBlk, and DepTimeBlk.
+
+##ROC and Model Statistics
+
+Compare ROC curves across the different methods we used
+```{r}
+#get predictions
+y.prob.lasso = predict(flight.lasso, s=flight.lasso.cv$lambda.1se, newx = flight.test.pred, type="response")[,1]
+y.prob.tree <- predict(flight.tree,flight.test,type="vector")[,2]
+y.prob.rf <- predict(flight.rf,flight.test,type="prob")[,2]
+y.prob.bag <- predict(flight.bag,newdata=flight.test,type="prob")[,2]
+y.prob.boost <- predict(boost.flight,flight.test,type="response")
+
+#calculate AUC
+auc.row = cbind(
+  auc(flight.obs, y.prob.lasso),
+  auc(flight.obs, y.prob.tree),
+  auc(flight.obs, y.prob.bag),
+  auc(flight.obs, y.prob.rf),
+  auc(flight.obs, y.prob.boost)
+)
+colnames(auc.row) = c('Lasso','Tree','Random Forest','Bagging','Boosting')
+rownames(auc.row) = 'AUC'
+```
+
+Print out final metrics to compare the various methods
+```{r}
+#cutoffs
+alpha.lasso <- 0.4
+alpha.tree <- 0.2
+alpha.rf <- 0.5
+alpha.bag <- 0.5
+alpha.boost <- 0.35
+
+#show confusion matrices
+#lasso
+classMetrics(y.prob.lasso,flight.obs,alpha.lasso, type = "all")$conf.mat
+#tree
+classMetrics(y.prob.tree,flight.obs,alpha.tree, type = "all")$conf.mat
+#random forest
+classMetrics(y.prob.rf,flight.obs,alpha.rf, type = "all")$conf.mat
+#bagging
+classMetrics(y.prob.bag,flight.obs,alpha.bag, type = "all")$conf.mat
+#boosting
+classMetrics(y.prob.boost,flight.obs,alpha.boost, type = "all")$conf.mat
+
+#calculate classification accuracy metrics
+final.metrics = cbind(
+  classMetrics(y.prob.lasso,flight.obs,alpha.lasso, type = "all")$perf,
+  classMetrics(y.prob.tree,flight.obs,alpha.tree, type = "all")$perf,
+  classMetrics(y.prob.rf,flight.obs,alpha.rf, type = "all")$perf,
+  classMetrics(y.prob.bag,flight.obs,alpha.bag, type = "all")$perf,
+  classMetrics(y.prob.boost,flight.obs,alpha.boost, type = "all")$perf
+)
+#name the columns
+colnames(final.metrics) = c('Lasso','Tree','Random Forest','Bagging','Boosting')
+final.metrics = rbind(final.metrics, auc.row)
+#round to 2 decimals
+final.metrics = round(final.metrics,2)
+
+final.metrics
+
+#plot ROC curve
+plot.roc(flight.obs, y.prob.tree, col = "black", add=F)
+plot.roc(flight.obs, y.prob.bag, col = "yellow", add=T)
+plot.roc(flight.obs, y.prob.rf, col = "blue", add=T)
+plot.roc(flight.obs, y.prob.boost, col = "orange", add=T)
+plot.roc(flight.obs, y.prob.lasso, col = "red", add=T)
+```
+
+##Discussion and Final Model Selection
+For reporting out classification performance metrics, we used the classMetrics formula that we created in Homework 5. 
+
+As we began to think about our model and what performance metrics we cared most about, we realized that False Positives are most costly to us, as they mean predicting a flight is delayed and it is observed to be not delayed, potentially resulting in the person missing their flight. 
+
+If our intention is to reduce the overall number of false positives, we care most about getting high specificity in our model. Therefore, we tuned the parameters of each of our models to achieve high levels of specificity. However, there is inherently a trade-off with sensitivity and we found that at the extremes you can trade off a little bit of specificity and get a lot of sensitivity. Therefore, we sought to maintain a moderately high level of specificity (80-90%) while keeping Positive Predicted Value above 50%.
+
+We tested out different cutoff values for each of our models, to see how they performed on specificity, sensitivity, and PPV. We tried to find the best cutoff for each model that resulted in the most satisfactory results for these three metrics.
+
+No cutoff value for lasso and decision tree could enable them to perform well enough on these metrics, and therefore they dropped out of consideration as our model "winners". 
+
+Now we were left with our bagging, boosting, and random forest models. In order to determine the best model, we plotted the ROC curves for each of the 3 models and evaluated the Area Under the Curve (AUC). AUC is defined as the probability that our scoring model will give a higher score to a flight that will actually be delayed than to a flight that won't be delayed.  While all 3 models performed similarly, we found that bagging had a slightly higher AUC than the other 2 models. 
+
+Therefore, we recommend using the **bagging model** to predict flight delays. It has the highest AUC, and performs well on specificity, sensitivity, and PPV
+
+The most common variables across our top three methods (all tree-based) were:
+
+- Month
+- DayofMonth
+- num.delays.so.far.today
+- num.delays.yest
+- DepTimeBlk
+- Carrier
+- DayOfWeek
+- CRSElapsedTime (length of flight in minutes)
+
+Of these, we found month and day of month surprising. However, our original graphs did show a marked difference in delays by month. DayOfMonth is harder to understand, but perhaps there are common delay patterns across the months. This would require further analysis.
+
+As for the remaining variables, it seems somewhat intuitive that they would all be highly predictive of delays. We were pleased to see that num.delays.so.far.today, and num.delays.yest, which we had created, were both highly predictive of delays.
+
+Perhaps surprisingly, destination-specific information was not the most predictive. That is, being a destination with high flight volume or high delay rates (such as New York and Chicago) was not  the most predictive of a delay.
+
+##Potential future work
+If we had more time, we would also investigate the following:
+
+- Handle canceled or diverted flights. These are currently not treated separately in our analysis.
+- Bring in daily weather data from an outside source.
+- Predict the actual amount of the delay. Right now we only consider this as a classification model. However, once a flight is classified as delayed, we might like to predict how delayed it would be.
+- Develop a more sophisticated way to build and evaluate models, based on how late the flight was. In particular, we would like the model to focus on not missing flights that are "very delayed" (eg more than 4 hours). To do this, we might upsample very delayed flights. Additionally, we could evaluate our models by a point system that penalizes the misclassification based on how delayed the flight was.
+
+##2016 comparison
+
+The project guidelines also recommended that we compare 2006 to 2016 data.
+
+The below plot shows number of flights by by carrier.
+```{r}
+flight.data.plot = ddply(flight.data4, "Carrier", summarise, count.flight = length(Carrier))
+flight.data.plot = arrange(flight.data.plot, desc(count.flight))
+
+flight.data.plot1 <- transform(flight.data.plot, Carrier = reorder(Carrier, count.flight))
+
+EDAcarrier.plot <- ggplot(flight.data.plot1, mapping = aes(x = Carrier, y = count.flight, fill = Carrier))
+
+plot1.2006 <-EDAcarrier.plot + geom_bar(stat = "identity") + ggtitle("Carrier Count 2006") + theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45), axis.title.x = element_blank(), axis.title.y = element_blank()) + ylim(0, 17500) + theme(legend.position="none")
+
+#2016 carrier count plot
+new.flight.data.plot = ddply(new.flight.data, "carrier", summarise, count.flight = length(carrier)/8)
+
+new.flight.data.plot1 <- transform(new.flight.data.plot, carrier = reorder(carrier, count.flight))
+
+new.carrier.plot <- ggplot(new.flight.data.plot1, mapping = aes(x = carrier, y = count.flight, fill = carrier))
+
+plot.1.2016 <- new.carrier.plot + geom_bar(stat = "identity") + ggtitle("Carrier Count 2016") + theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45), axis.title.x = element_blank(), axis.title.y = element_blank()) + theme(legend.position="none")
+
+#compare 2006 vs. 2016 
+grid.arrange(plot1.2006, plot.1.2016)
+```
+In 2006 vs 2016. We notice that only Southwest is in both groups. The other two have changed. USAir left Pittsburgh, and also was later acquired. American and Delta are now the two largest carriers besides Southwest.
+
+U.S. Air was a dominant force at Pittsburgh International Airport in the early 2000's, but by 2006, had already cut its total flight offering by 50%. Looking at our current data set in comparison to newer data obtained on the Bureau of Transportation website, we notice a substantial shakeup of carriers, routes, capacity, and many other meaningful descriptors in the years 2006-2016. Examining the 2016 flight data for even one month is enough to see that in order to test our analysis we would have to wrangle the new data set so that our model would be amenable to the airline mergers and flow changes at PIT. A true apples-to-apples comparison of the data from 2006 to 2016 (the most current available online) would require deeper wrangling work and could be an interesting project moving forward.
